@@ -1,0 +1,20 @@
+[project]
+name = "octo-spoon"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "lm-eval>=0.4.9.1",
+    "transformers>=4.56.2",
+]
+
+[project.optional-dependencies]
+# Pick one when syncing:
+cu128 = [
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+]
+rocm = [
+]
+
+[tool.uv.pip] # default
+extra = ["cu128"]
