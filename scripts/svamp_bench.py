@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Quick BoolQ benchmark for Hugging Face causal LMs.
+"""Quick SVAMP benchmark for Hugging Face causal LMs.
 
-The script formats each BoolQ example as a passage + question prompt and
-expects the model to reply with "True" or "False". Outputs are matched via
-regex and counted toward accuracy.
+Prompts each math word problem and expects a single numeric answer. Outputs are
+regex-matched for a numeric token and compared exactly to the reference answer.
 
-Examples:
-  python scripts/boolq_bench.py \
-    --models Mostafa8Mehrabi/qwen3-30m-tinystories-final nickypro/tinyllama-42M HuggingFaceTB/SmolLM2-135M HuggingFaceTB/SmolLM2-360M Qwen/Qwen3-0.6B-Base\
-    --split validation --samples 200 --dtype bfloat16
+Example:
+  python scripts/svamp_bench.py \
+    --models nickypro/tinyllama-42M HuggingFaceTB/SmolLM2-135M HuggingFaceTB/SmolLM2-360M Qwen/Qwen3-0.6B-Base HuggingFaceTB/SmolLM2-1.7B\
+    --split test --samples 200 --dtype bfloat16
 """
 
 import os
@@ -18,35 +17,34 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 import argparse
 import random
 import re
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 PROMPT_TEMPLATE = (
-    "Answer the question about the passage with a single word: True or False.\n\n"
-    "Passage:\n{passage}\n\n"
+    "Solve the math problem and reply with only the final numeric answer.\n\n"
+    "Given: {body}\n"
     "Question: {question}\n"
     "Answer:"
 )
 
-TRUE_FALSE_RE = re.compile(r"\b(true|false)\b", flags=re.IGNORECASE)
+NUMBER_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="BoolQ evaluator for HF causal LMs")
-    ap.add_argument("--models", nargs="+", required=True,
-                    help="HF model ids or local paths")
-    ap.add_argument("--split", default="validation", choices=["train", "validation"],
-                    help="BoolQ split to sample from (default: validation)")
+    ap = argparse.ArgumentParser(description="SVAMP evaluator for HF causal LMs")
+    ap.add_argument("--models", nargs="+", required=True, help="HF model ids or local paths")
+    ap.add_argument("--split", default="test", choices=["train", "test"],
+                    help="SVAMP split to sample from (default: test)")
     ap.add_argument("--samples", type=int, default=200,
                     help="Number of examples to evaluate (default: 200)")
     ap.add_argument("--seed", type=int, default=1234, help="RNG seed for sampling")
 
     # Generation knobs
-    ap.add_argument("--max-new", type=int, default=4, help="Max new tokens to generate")
+    ap.add_argument("--max-new", type=int, default=8, help="Max new tokens to generate")
     ap.add_argument("--batch-size", type=int, default=8, help="Generation batch size")
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="Sampling temperature (0 => greedy)")
@@ -75,8 +73,8 @@ def chunked_indices(length: int, size: int) -> Iterable[Tuple[int, int]]:
         yield start, min(start + size, length)
 
 
-def prepare_examples(split: str, samples: int, seed: int) -> Tuple[List[str], List[bool]]:
-    ds = load_dataset("boolq", split=split)
+def prepare_examples(split: str, samples: int, seed: int) -> Tuple[List[str], List[str]]:
+    ds = load_dataset("ChilleD/SVAMP", split=split)
     total = len(ds)
     if samples > total:
         samples = total
@@ -85,20 +83,35 @@ def prepare_examples(split: str, samples: int, seed: int) -> Tuple[List[str], Li
     indices = rng.sample(range(total), samples)
 
     prompts: List[str] = []
-    answers: List[bool] = []
+    answers: List[str] = []
     for idx in indices:
         ex = ds[idx]
-        passage = (ex.get("passage") or "").strip()
-        question = (ex.get("question") or "").strip()
-        answer = bool(ex.get("answer"))
-        prompt = PROMPT_TEMPLATE.format(passage=passage, question=question)
-        prompts.append(prompt)
+        body = (ex.get("Body") or "").strip()
+        question = (ex.get("Question") or "").strip()
+        answer = str(ex.get("Answer")).strip()
+        prompts.append(PROMPT_TEMPLATE.format(body=body, question=question))
         answers.append(answer)
 
     return prompts, answers
 
 
-def evaluate_model(model_id: str, prompts: List[str], answers: List[bool], args: argparse.Namespace):
+def normalize_number(text: str) -> Optional[str]:
+    match = NUMBER_RE.fullmatch(text.strip())
+    if match:
+        num = match.group(0)
+        if num.startswith("+"):
+            num = num[1:]
+        return num
+    match = NUMBER_RE.search(text)
+    if match:
+        num = match.group(0)
+        if num.startswith("+"):
+            num = num[1:]
+        return num
+    return None
+
+
+def evaluate_model(model_id: str, prompts: List[str], answers: List[str], args: argparse.Namespace):
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=args.trust_remote_code)
     tok.padding_side = "left"
     need_resize = False
@@ -158,12 +171,12 @@ def evaluate_model(model_id: str, prompts: List[str], answers: List[bool], args:
             prefix_len = int(in_lens[i].item())
             generated = gen[i, prefix_len:].detach().cpu()
             text = tok.decode(generated, skip_special_tokens=True)
-            match = TRUE_FALSE_RE.search(text)
-            if not match:
+            pred = normalize_number(text)
+            if pred is None:
                 unmatched += 1
                 continue
-            pred = match.group(1).lower() == "true"
-            if pred == answers[base_idx]:
+            gt = normalize_number(answers[base_idx])
+            if pred == gt:
                 correct += 1
 
     matched = total - unmatched
@@ -182,7 +195,7 @@ def main():
     args = parse_args()
 
     prompts, answers = prepare_examples(args.split, args.samples, args.seed)
-    print(f"Loaded {len(prompts)} BoolQ examples from split '{args.split}'.")
+    print(f"Loaded {len(prompts)} SVAMP examples from split '{args.split}'.")
 
     results = []
     for mid in args.models:
@@ -196,7 +209,7 @@ def main():
         )
 
     width = max(len(m) for m, *_ in results) + 2
-    print("\n=== BoolQ Accuracy Summary ===")
+    print("\n=== SVAMP Accuracy Summary ===")
     print(f"{'Model'.ljust(width)} | Acc% | Match% | Acc@Match% | Correct/Total | Matched | Unmatched")
     print("-" * (width + 54))
     total = len(prompts)

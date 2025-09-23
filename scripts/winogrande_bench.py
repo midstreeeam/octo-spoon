@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Quick BoolQ benchmark for Hugging Face causal LMs.
+"""Quick Winogrande benchmark for Hugging Face causal LMs.
 
-The script formats each BoolQ example as a passage + question prompt and
-expects the model to reply with "True" or "False". Outputs are matched via
-regex and counted toward accuracy.
+Each example is formatted as a cloze-style prompt asking the model to reply
+with a single letter ("A" or "B"). Predictions are matched with a lightweight
+parser that recognizes the first option letter/word and tallies accuracy.
 
-Examples:
-  python scripts/boolq_bench.py \
-    --models Mostafa8Mehrabi/qwen3-30m-tinystories-final nickypro/tinyllama-42M HuggingFaceTB/SmolLM2-135M HuggingFaceTB/SmolLM2-360M Qwen/Qwen3-0.6B-Base\
-    --split validation --samples 200 --dtype bfloat16
+Example:
+  python scripts/winogrande_bench.py \
+    --models nickypro/tinyllama-42M HuggingFaceTB/SmolLM2-135M HuggingFaceTB/SmolLM2-360M Qwen/Qwen3-0.6B-Base\
+    --config winogrande_xl --split validation --samples 1000 --dtype bfloat16
 """
 
 import os
@@ -18,29 +18,32 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 import argparse
 import random
 import re
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 PROMPT_TEMPLATE = (
-    "Answer the question about the passage with a single word: True or False.\n\n"
-    "Passage:\n{passage}\n\n"
-    "Question: {question}\n"
+    "Choose the correct option (A or B) to fill in the blank. "
+    "Reply with a single token: either the letter A/B or the word from the correct option.\n\n"
+    "Sentence: {sentence}\n"
+    "Option A: {option1}\n"
+    "Option B: {option2}\n"
     "Answer:"
 )
 
-TRUE_FALSE_RE = re.compile(r"\b(true|false)\b", flags=re.IGNORECASE)
+LETTER_RE = re.compile(r"([A-Za-z0-9]+)")
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="BoolQ evaluator for HF causal LMs")
-    ap.add_argument("--models", nargs="+", required=True,
-                    help="HF model ids or local paths")
-    ap.add_argument("--split", default="validation", choices=["train", "validation"],
-                    help="BoolQ split to sample from (default: validation)")
+    ap = argparse.ArgumentParser(description="Winogrande evaluator for HF causal LMs")
+    ap.add_argument("--models", nargs="+", required=True, help="HF model ids or local paths")
+    ap.add_argument("--config", default="winogrande_xl",
+                    help="Winogrande configuration (default: winogrande_xl)")
+    ap.add_argument("--split", default="validation", choices=["train", "validation", "test"],
+                    help="Dataset split to sample from (default: validation)")
     ap.add_argument("--samples", type=int, default=200,
                     help="Number of examples to evaluate (default: 200)")
     ap.add_argument("--seed", type=int, default=1234, help="RNG seed for sampling")
@@ -75,8 +78,8 @@ def chunked_indices(length: int, size: int) -> Iterable[Tuple[int, int]]:
         yield start, min(start + size, length)
 
 
-def prepare_examples(split: str, samples: int, seed: int) -> Tuple[List[str], List[bool]]:
-    ds = load_dataset("boolq", split=split)
+def prepare_examples(config: str, split: str, samples: int, seed: int) -> Tuple[List[str], List[int], List[Tuple[str, str]]]:
+    ds = load_dataset("winogrande", config, split=split)
     total = len(ds)
     if samples > total:
         samples = total
@@ -85,20 +88,58 @@ def prepare_examples(split: str, samples: int, seed: int) -> Tuple[List[str], Li
     indices = rng.sample(range(total), samples)
 
     prompts: List[str] = []
-    answers: List[bool] = []
+    answers: List[int] = []
+    options: List[Tuple[str, str]] = []
+
     for idx in indices:
         ex = ds[idx]
-        passage = (ex.get("passage") or "").strip()
-        question = (ex.get("question") or "").strip()
-        answer = bool(ex.get("answer"))
-        prompt = PROMPT_TEMPLATE.format(passage=passage, question=question)
+        sentence = (ex.get("sentence") or "").strip()
+        option1 = (ex.get("option1") or "").strip()
+        option2 = (ex.get("option2") or "").strip()
+        label = ex.get("answer")
+        if isinstance(label, str):
+            target = 0 if label.strip() == "1" else 1
+        else:
+            target = int(label) - 1
+
+        prompt = PROMPT_TEMPLATE.format(sentence=sentence, option1=option1, option2=option2)
         prompts.append(prompt)
-        answers.append(answer)
+        answers.append(target)
+        options.append((option1, option2))
 
-    return prompts, answers
+    return prompts, answers, options
 
 
-def evaluate_model(model_id: str, prompts: List[str], answers: List[bool], args: argparse.Namespace):
+def parse_prediction(text: str, option_pair: Tuple[str, str]) -> Optional[int]:
+    option1, option2 = option_pair
+    lowered = text.lower()
+
+    match = LETTER_RE.search(lowered)
+    if match:
+        token = match.group(1)
+        if token in {"a", 'optiona a', "optiona", "option1"}:
+            return 0
+        if token in {"b", "optiona b", "optionb", "option2"}:
+            return 1
+
+        first_opt1 = option1.split()
+        first_opt2 = option2.split()
+        if first_opt1 and token == first_opt1[0].lower():
+            return 0
+        if first_opt2 and token == first_opt2[0].lower():
+            return 1
+
+    opt1 = option1.lower()
+    opt2 = option2.lower()
+    found1 = bool(opt1) and opt1 in lowered
+    found2 = bool(opt2) and opt2 in lowered
+    if found1 ^ found2:
+        return 0 if found1 else 1
+
+    return None
+
+
+def evaluate_model(model_id: str, prompts: List[str], answers: List[int], options: List[Tuple[str, str]], args: argparse.Namespace):
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=args.trust_remote_code)
     tok.padding_side = "left"
     need_resize = False
@@ -158,11 +199,10 @@ def evaluate_model(model_id: str, prompts: List[str], answers: List[bool], args:
             prefix_len = int(in_lens[i].item())
             generated = gen[i, prefix_len:].detach().cpu()
             text = tok.decode(generated, skip_special_tokens=True)
-            match = TRUE_FALSE_RE.search(text)
-            if not match:
+            pred = parse_prediction(text, options[base_idx])
+            if pred is None:
                 unmatched += 1
                 continue
-            pred = match.group(1).lower() == "true"
             if pred == answers[base_idx]:
                 correct += 1
 
@@ -181,13 +221,13 @@ def evaluate_model(model_id: str, prompts: List[str], answers: List[bool], args:
 def main():
     args = parse_args()
 
-    prompts, answers = prepare_examples(args.split, args.samples, args.seed)
-    print(f"Loaded {len(prompts)} BoolQ examples from split '{args.split}'.")
+    prompts, answers, options = prepare_examples(args.config, args.split, args.samples, args.seed)
+    print(f"Loaded {len(prompts)} Winogrande examples from {args.config}/{args.split}.")
 
     results = []
     for mid in args.models:
         print(f"\nEvaluating {mid} ...")
-        acc, match_rate, matched_acc, correct, matched, unmatched = evaluate_model(mid, prompts, answers, args)
+        acc, match_rate, matched_acc, correct, matched, unmatched = evaluate_model(mid, prompts, answers, options, args)
         results.append((mid, acc, match_rate, matched_acc, correct, matched, unmatched))
         print(
             f"Accuracy: {acc * 100:.2f}% ({correct}/{len(prompts)} correct) | "
@@ -196,7 +236,7 @@ def main():
         )
 
     width = max(len(m) for m, *_ in results) + 2
-    print("\n=== BoolQ Accuracy Summary ===")
+    print("\n=== Winogrande Accuracy Summary ===")
     print(f"{'Model'.ljust(width)} | Acc% | Match% | Acc@Match% | Correct/Total | Matched | Unmatched")
     print("-" * (width + 54))
     total = len(prompts)
