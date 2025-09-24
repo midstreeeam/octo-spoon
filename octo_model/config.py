@@ -43,7 +43,7 @@ class OctoConfig(PretrainedConfig):
         )
 
         if num_key_value_heads is None:
-            num_key_value_heads = max(1, num_attention_heads // 2)
+            num_key_value_heads = max(1, num_attention_heads // 4)
         if num_attention_heads % num_key_value_heads != 0:
             raise ValueError("`num_attention_heads` must be divisible by `num_key_value_heads` for grouped attention.")
         self.num_key_value_heads = num_key_value_heads
