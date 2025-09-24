@@ -108,7 +108,8 @@ class StreamingTextDataset(Dataset):
         total_tokens = 0
         for idx in sample_indices:
             text = self.dataset[idx][self.text_column]
-            tokens = self.tokenizer(text, return_attention_mask=False, add_special_tokens=True)
+            tokens = self.tokenizer(text, return_attention_mask=False, add_special_tokens=True,
+                                   max_length=self.block_size, truncation=True)
             total_tokens += len(tokens["input_ids"])
         
         avg_tokens_per_example = total_tokens / sample_size
@@ -127,7 +128,8 @@ class StreamingTextDataset(Dataset):
         idx = start_idx
         while len(self.blocks) < self.buffer_size and idx < len(self.dataset):
             text = self.dataset[idx][self.text_column]
-            tokens = self.tokenizer(text, return_attention_mask=False, add_special_tokens=True)
+            tokens = self.tokenizer(text, return_attention_mask=False, add_special_tokens=True,
+                                   max_length=self.block_size, truncation=True)
             self.token_buffer.extend(tokens["input_ids"])
             
             # Create blocks from the buffer
@@ -191,7 +193,9 @@ class IterableStreamingTextDataset(torch.utils.data.IterableDataset):
             tokens = self.tokenizer(
                 text,
                 return_attention_mask=False,
-                add_special_tokens=True
+                add_special_tokens=True,
+                max_length=self.block_size,
+                truncation=True
             )
             token_buffer.extend(tokens["input_ids"])
             
@@ -221,8 +225,8 @@ def prepare_tokenizer(train_cfg: TrainingConfig) -> Any:
     tokenizer = AutoTokenizer.from_pretrained(train_cfg.tokenizer_name, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.bos_token
-    if tokenizer.model_max_length and tokenizer.model_max_length < train_cfg.block_size:
-        tokenizer.model_max_length = train_cfg.block_size
+    # Always set model_max_length to block_size to avoid sequence length issues
+    tokenizer.model_max_length = train_cfg.block_size
     return tokenizer
 
 
