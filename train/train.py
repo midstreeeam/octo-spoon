@@ -6,11 +6,11 @@ import random
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import torch
 from datasets import load_dataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from tqdm.auto import tqdm
 
@@ -75,6 +75,134 @@ class TrainingConfig:
         )
 
 
+class StreamingTextDataset(Dataset):
+    """Dataset that tokenizes text on-the-fly and concatenates into fixed-size blocks."""
+    
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        text_column: str,
+        block_size: int,
+        buffer_size: int = 10000,
+    ):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.text_column = text_column
+        self.block_size = block_size
+        self.buffer_size = buffer_size
+        
+        # Buffer for accumulating tokens
+        self.token_buffer = []
+        self.blocks = []
+        
+        # Pre-compute approximate number of blocks (rough estimate)
+        self._estimate_length()
+    
+    def _estimate_length(self):
+        """Estimate the number of blocks in the dataset."""
+        # Sample a small portion to estimate average tokens per example
+        sample_size = min(100, len(self.dataset))
+        sample_indices = random.sample(range(len(self.dataset)), sample_size)
+        
+        total_tokens = 0
+        for idx in sample_indices:
+            text = self.dataset[idx][self.text_column]
+            tokens = self.tokenizer(text, return_attention_mask=False, add_special_tokens=True)
+            total_tokens += len(tokens["input_ids"])
+        
+        avg_tokens_per_example = total_tokens / sample_size
+        estimated_total_tokens = avg_tokens_per_example * len(self.dataset)
+        self.estimated_blocks = int(estimated_total_tokens / self.block_size)
+    
+    def __len__(self):
+        return self.estimated_blocks
+    
+    def _refill_buffer(self, start_idx: int = 0):
+        """Refill the token buffer by processing more examples."""
+        self.token_buffer = []
+        self.blocks = []
+        
+        # Process examples until we have enough blocks
+        idx = start_idx
+        while len(self.blocks) < self.buffer_size and idx < len(self.dataset):
+            text = self.dataset[idx][self.text_column]
+            tokens = self.tokenizer(text, return_attention_mask=False, add_special_tokens=True)
+            self.token_buffer.extend(tokens["input_ids"])
+            
+            # Create blocks from the buffer
+            while len(self.token_buffer) >= self.block_size:
+                block = self.token_buffer[:self.block_size]
+                self.blocks.append(block)
+                self.token_buffer = self.token_buffer[self.block_size:]
+            
+            idx += 1
+        
+        return idx
+    
+    def __getitem__(self, idx):
+        # For simplicity in DataLoader with shuffle, we'll process examples sequentially
+        # and return a random block. This maintains randomness while being efficient.
+        if not self.blocks:
+            # Refill buffer starting from a random position for variety
+            start_idx = random.randint(0, max(0, len(self.dataset) - self.buffer_size * 10))
+            self._refill_buffer(start_idx)
+        
+        if not self.blocks:
+            # If still no blocks, create a dummy one
+            block = [self.tokenizer.pad_token_id] * self.block_size
+        else:
+            # Pop a block from the buffer
+            block = self.blocks.pop(random.randint(0, len(self.blocks) - 1))
+        
+        input_ids = torch.tensor(block, dtype=torch.long)
+        return {"input_ids": input_ids, "labels": input_ids.clone()}
+
+
+class IterableStreamingTextDataset(torch.utils.data.IterableDataset):
+    """Iterable dataset that streams and tokenizes text on-the-fly."""
+    
+    def __init__(
+        self,
+        dataset,
+        tokenizer,
+        text_column: str,
+        block_size: int,
+        shuffle: bool = True,
+        buffer_size: int = 1000,
+    ):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.text_column = text_column
+        self.block_size = block_size
+        self.shuffle = shuffle
+        self.buffer_size = buffer_size
+    
+    def __iter__(self):
+        token_buffer = []
+        
+        # Create indices and optionally shuffle
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            random.shuffle(indices)
+        
+        for idx in indices:
+            text = self.dataset[idx][self.text_column]
+            tokens = self.tokenizer(
+                text,
+                return_attention_mask=False,
+                add_special_tokens=True
+            )
+            token_buffer.extend(tokens["input_ids"])
+            
+            # Yield complete blocks
+            while len(token_buffer) >= self.block_size:
+                block = token_buffer[:self.block_size]
+                input_ids = torch.tensor(block, dtype=torch.long)
+                yield {"input_ids": input_ids, "labels": input_ids.clone()}
+                token_buffer = token_buffer[self.block_size:]
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -117,68 +245,49 @@ def log_event(message: str, logger: Optional[logging.Logger]) -> None:
     tqdm.write(message)
 
 
-def tokenize_dataset(dataset, tokenizer, text_column: str) -> Dict[str, Any]:
-    def tokenize_function(batch: Dict[str, list[str]]) -> Dict[str, Any]:
-        return tokenizer(batch[text_column], return_attention_mask=False, add_special_tokens=True)
-
-    tokenized = dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=dataset.column_names,
-        desc="Tokenizing",
-    )
-
-    return tokenized
-
-
-def chunk_dataset(tokenized_dataset, block_size: int) -> Any:
-    def group_texts(examples: Dict[str, list[list[int]]]) -> Dict[str, Any]:
-        concatenated = []
-        for ids in examples["input_ids"]:
-            concatenated.extend(ids)
-        total_length = (len(concatenated) // block_size) * block_size
-        if total_length == 0:
-            return {"input_ids": [], "labels": []}
-        input_ids = [
-            concatenated[i : i + block_size]
-            for i in range(0, total_length, block_size)
-        ]
-        return {"input_ids": input_ids, "labels": input_ids.copy()}
-
-    lm_dataset = tokenized_dataset.map(
-        group_texts,
-        batched=True,
-        batch_size=1000,
-        desc="Grouping into blocks",
-    )
-    lm_dataset.set_format(type="torch", columns=["input_ids", "labels"])
-    return lm_dataset
-
-
 def build_dataloaders(train_cfg: TrainingConfig, tokenizer) -> tuple[DataLoader, Optional[DataLoader]]:
+    """Build data loaders with on-the-fly tokenization."""
+    # Load raw datasets
     raw_train = load_dataset(train_cfg.dataset_name, split=train_cfg.train_split)
-    tokenized_train = tokenize_dataset(raw_train, tokenizer, train_cfg.text_column)
-    train_dataset = chunk_dataset(tokenized_train, train_cfg.block_size)
-
+    
+    # Create streaming dataset for training
+    train_dataset = StreamingTextDataset(
+        raw_train,
+        tokenizer,
+        train_cfg.text_column,
+        train_cfg.block_size,
+        buffer_size=max(100, train_cfg.batch_size * 10),
+    )
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_cfg.batch_size,
         shuffle=True,
         drop_last=True,
+        num_workers=0,  # Set to 0 for simplicity, can be increased if needed
     )
-
+    
     eval_loader = None
     if train_cfg.eval_split:
         raw_eval = load_dataset(train_cfg.dataset_name, split=train_cfg.eval_split)
-        tokenized_eval = tokenize_dataset(raw_eval, tokenizer, train_cfg.text_column)
-        eval_dataset = chunk_dataset(tokenized_eval, train_cfg.block_size)
+        
+        # For eval, we can use the iterable dataset for more consistent evaluation
+        eval_dataset = IterableStreamingTextDataset(
+            raw_eval,
+            tokenizer,
+            train_cfg.text_column,
+            train_cfg.block_size,
+            shuffle=False,  # No shuffling for evaluation
+        )
+        
         eval_loader = DataLoader(
             eval_dataset,
             batch_size=train_cfg.batch_size,
             shuffle=False,
             drop_last=False,
+            num_workers=0,
         )
-
+    
     return train_loader, eval_loader
 
 
@@ -243,7 +352,7 @@ def evaluate(
             data_loader,
             desc="Eval",
             leave=False,
-            total=max_batches if max_batches is not None else len(data_loader),
+            total=max_batches if max_batches is not None else None,
         )
         for idx, batch in enumerate(progress_bar):
             input_ids = batch["input_ids"].to(device)
@@ -268,9 +377,16 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
     model.to(device)
 
     gradient_accumulation = max(1, train_cfg.gradient_accumulation_steps)
-    if len(train_loader) == 0:
-        raise ValueError("Training dataloader is empty. Reduce block_size or batch_size.")
-    steps_per_epoch = math.ceil(len(train_loader) / gradient_accumulation)
+    
+    # For streaming datasets, we need to estimate steps per epoch
+    # We'll use the estimated length from the dataset
+    if hasattr(train_loader.dataset, 'estimated_blocks'):
+        estimated_steps = train_loader.dataset.estimated_blocks // train_cfg.batch_size
+    else:
+        # Fallback: use a reasonable default
+        estimated_steps = 1000
+    
+    steps_per_epoch = math.ceil(estimated_steps / gradient_accumulation)
     total_updates = max(1, steps_per_epoch * train_cfg.num_epochs)
 
     optimizer = torch.optim.AdamW(
@@ -328,7 +444,8 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
             leave=False,
         )
 
-        for batch_idx, batch in enumerate(train_loader):
+        batch_count = 0
+        for batch in train_loader:
             if skip_micro_steps > 0:
                 skip_micro_steps -= 1
                 continue
@@ -395,6 +512,11 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
 
                 if completed_updates >= total_updates:
                     break
+            
+            batch_count += 1
+            # Break if we've processed enough batches for this epoch estimate
+            if batch_count >= estimated_steps:
+                break
 
         skip_micro_steps_initial = 0
 
