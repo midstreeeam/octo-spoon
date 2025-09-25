@@ -211,3 +211,4 @@ checkpoints
 logs
 uv.lock
 pyproject.toml
+docs-vibe-coding/
