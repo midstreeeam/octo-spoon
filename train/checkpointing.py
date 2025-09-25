@@ -39,7 +39,7 @@ def load_checkpoint(
     scheduler,
     scaler: Optional[torch.cuda.amp.GradScaler],
     checkpoint_path: Path,
-) -> int:
+) -> tuple[int, dict]:
     payload = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(payload["model_state"])
     optimizer.load_state_dict(payload["optimizer_state"])
@@ -47,4 +47,5 @@ def load_checkpoint(
         scheduler.load_state_dict(payload["scheduler_state"])
     if scaler is not None and payload.get("scaler_state") is not None:
         scaler.load_state_dict(payload["scaler_state"])
-    return int(payload["step"])
+    step = int(payload["step"])
+    return step, payload

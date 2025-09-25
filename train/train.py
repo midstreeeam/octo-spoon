@@ -25,7 +25,6 @@ from train.checkpointing import load_checkpoint, save_checkpoint
 from train.configuration import TrainingConfig, load_training_config
 from train.data import build_dataloaders
 from train.logging_utils import log_event, setup_logging
-from train.memory import GPUMemoryMonitor
 from train.utils import prepare_tokenizer, set_seed
 
 
@@ -50,8 +49,7 @@ def evaluate(
     device: torch.device,
     max_batches: Optional[int] = None,
     use_mixed_precision: bool = True,
-    memory_monitor: Optional[GPUMemoryMonitor] = None,
-) -> tuple[float, Optional[str]]:
+) -> float:
     model.eval()
     losses = []
     progress_bar = tqdm(
@@ -76,9 +74,8 @@ def evaluate(
     progress_bar.close()
     model.train()
 
-    memory_summary = memory_monitor.snapshot(reset_peak=False) if memory_monitor else None
     mean_loss = float(sum(losses) / max(len(losses), 1))
-    return mean_loss, memory_summary
+    return mean_loss
 
 
 def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[logging.Logger] = None) -> None:
@@ -109,16 +106,11 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
         lr=train_cfg.learning_rate,
         weight_decay=train_cfg.weight_decay,
     )
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=min(train_cfg.warmup_steps, total_updates),
-        num_training_steps=total_updates,
-    )
 
     checkpoint_dir = Path(train_cfg.checkpoint_dir)
-    memory_monitor = GPUMemoryMonitor(device, enabled=train_cfg.enable_memory_monitor)
 
     completed_updates = 0
+    resume_payload: Optional[dict] = None
     if train_cfg.resume_from:
         resume_path = Path(train_cfg.resume_from)
         if resume_path.is_dir():
@@ -126,40 +118,52 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
             if latest_file.exists():
                 resume_path = resume_path / latest_file.read_text(encoding="utf-8").strip()
         if resume_path.exists():
-            completed_updates = load_checkpoint(model, optimizer, scheduler, scaler, resume_path)
+            completed_updates, resume_payload = load_checkpoint(
+                model,
+                optimizer,
+                scheduler=None,
+                scaler=scaler,
+                checkpoint_path=resume_path,
+            )
             log_event(f"Resumed from {resume_path} @ update {completed_updates}", logger)
         else:
-            log_event(f"Resume path {resume_path} not found; starting fresh.", logger)
+            raise FileNotFoundError(f"Resume path {resume_path} not found.")
 
     optimizer.zero_grad(set_to_none=True)
 
-    if completed_updates >= total_updates:
+    target_updates = completed_updates + total_updates
+
+    if completed_updates >= target_updates:
         log_event("Training already completed for the configured epochs.", logger)
         return
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=min(train_cfg.warmup_steps, target_updates),
+        num_training_steps=target_updates,
+    )
+
+    if resume_payload and resume_payload.get("scheduler_state") is not None:
+        scheduler.load_state_dict(resume_payload["scheduler_state"])
+        resume_payload = None
 
     running_loss = 0.0
     steps_since_log = 0
     accumulated_loss = 0.0
     accum_steps = 0
 
-    start_epoch = completed_updates // steps_per_epoch
-    skip_micro_steps_initial = (completed_updates % steps_per_epoch) * gradient_accumulation
-
-    for epoch in range(start_epoch, train_cfg.num_epochs):
-        epoch_desc = f"Epoch {epoch + 1}/{train_cfg.num_epochs}"
-        skip_micro_steps = skip_micro_steps_initial if epoch == start_epoch else 0
-        remaining_updates_epoch = min(total_updates - completed_updates, steps_per_epoch)
-        if remaining_updates_epoch <= 0:
+    for epoch_idx in range(train_cfg.num_epochs):
+        updates_remaining_total = target_updates - completed_updates
+        if updates_remaining_total <= 0:
             break
+
+        remaining_updates_epoch = min(updates_remaining_total, steps_per_epoch)
+        epoch_desc = f"Epoch {epoch_idx + 1}/{train_cfg.num_epochs}"
 
         progress_bar = tqdm(total=remaining_updates_epoch, desc=epoch_desc, leave=False)
         batch_count = 0
 
         for batch in train_loader:
-            if skip_micro_steps > 0:
-                skip_micro_steps -= 1
-                continue
-
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
 
@@ -206,21 +210,15 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
                     avg_loss = running_loss / max(steps_since_log, 1)
                     perplexity = math.exp(avg_loss) if avg_loss < 20 else float("inf")
                     ppl_display = f"{perplexity:.2f}" if perplexity != float("inf") else "inf"
-                    memory_snapshot = (
-                        memory_monitor.snapshot(reset_peak=True) if memory_monitor else None
+                    progress_bar.set_postfix(
+                        step=completed_updates,
+                        loss=f"{avg_loss:.4f}",
+                        ppl=ppl_display,
                     )
-                    postfix = {
-                        "step": completed_updates,
-                        "loss": f"{avg_loss:.4f}",
-                        "ppl": ppl_display,
-                    }
-                    if memory_snapshot:
-                        postfix["mem"] = memory_snapshot
-                    progress_bar.set_postfix(**postfix)
-                    log_message = f"Step {completed_updates}: loss={avg_loss:.4f} ppl={ppl_display}"
-                    if memory_snapshot:
-                        log_message += f" {memory_snapshot}"
-                    log_event(log_message, logger)
+                    log_event(
+                        f"Step {completed_updates}: loss={avg_loss:.4f} ppl={ppl_display}",
+                        logger,
+                    )
                     running_loss = 0.0
                     steps_since_log = 0
 
@@ -229,22 +227,19 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
                     and completed_updates % train_cfg.eval_interval_steps == 0
                     and eval_loader is not None
                 ):
-                    eval_loss, eval_memory = evaluate(
+                    eval_loss = evaluate(
                         model,
                         eval_loader,
                         device,
                         max_batches=train_cfg.eval_max_batches,
                         use_mixed_precision=train_cfg.use_mixed_precision,
-                        memory_monitor=memory_monitor,
                     )
                     eval_ppl = math.exp(eval_loss) if eval_loss < 20 else float("inf")
                     ppl_eval_display = f"{eval_ppl:.2f}" if eval_ppl != float("inf") else "inf"
-                    eval_message = (
-                        f"[Eval] step {completed_updates}: loss={eval_loss:.4f} ppl={ppl_eval_display}"
+                    log_event(
+                        f"[Eval] step {completed_updates}: loss={eval_loss:.4f} ppl={ppl_eval_display}",
+                        logger,
                     )
-                    if eval_memory:
-                        eval_message += f" {eval_memory}"
-                    log_event(eval_message, logger)
 
                 if train_cfg.save_interval_steps and completed_updates % train_cfg.save_interval_steps == 0:
                     ckpt_path = save_checkpoint(
@@ -259,21 +254,31 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
 
                 accum_steps = 0
 
-                if completed_updates >= total_updates:
+                if completed_updates >= target_updates:
                     break
 
             batch_count += 1
             if batch_count >= estimated_steps:
                 break
 
-        skip_micro_steps_initial = 0
         progress_bar.close()
 
-        if completed_updates >= total_updates:
+        if completed_updates >= target_updates:
             break
-        log_event(f"{epoch_desc} complete ({completed_updates}/{total_updates} updates)", logger)
 
-    final_ckpt = save_checkpoint(model, optimizer, scheduler, scaler, completed_updates, checkpoint_dir)
+        log_event(
+            f"{epoch_desc} complete ({completed_updates}/{target_updates} updates)",
+            logger,
+        )
+
+    final_ckpt = save_checkpoint(
+        model,
+        optimizer,
+        scheduler,
+        scaler,
+        completed_updates,
+        checkpoint_dir,
+    )
     log_event(f"Training complete. Final checkpoint saved to {final_ckpt}", logger)
 
 

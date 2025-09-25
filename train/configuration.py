@@ -31,7 +31,6 @@ class TrainingConfig:
     eval_max_batches: Optional[int]
     use_mixed_precision: bool = True
     use_gradient_checkpointing: bool = False
-    enable_memory_monitor: bool = True
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TrainingConfig":
@@ -59,7 +58,6 @@ class TrainingConfig:
             eval_max_batches=data.get("eval_max_batches"),
             use_mixed_precision=data.get("use_mixed_precision", True),
             use_gradient_checkpointing=data.get("use_gradient_checkpointing", False),
-            enable_memory_monitor=data.get("enable_memory_monitor", True),
         )
 
 
