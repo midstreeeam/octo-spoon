@@ -22,11 +22,36 @@ python pseudo_pll.py \
   --models nickypro/tinyllama-42M HuggingFaceTB/SmolLM2-135M HuggingFaceTB/SmolLM2-1.7B \
   --judge roberta-large \
   --samples 10 --prompt-min 30 --prompt-max 60 --ref-toks 40 \
-  --corpus-ds wikitext --corpus-config wikitext-103-raw-v1 --corpus-split train[:1%]
+  --corpus-ds wikitext --corpus-config wikitext-103-raw-v1 --corpus-split test[:1%]
+
+
+# run octo
+python scripts/pseudo_pll.py --phase both --save run.json \
+    --models HuggingFaceTB/SmolLM2-135M nickypro/tinyllama-42M  \
+    --octo-checkpoint checkpoints/tinystory/ar_tinystory_2epoch.pt  \
+    --octo-tokenizer gpt2 --prompt-min 30 --prompt-max 60 --ref-toks 40 \
+    --samples 50 --corpus-ds wikitext --corpus-config wikitext-103-raw-v1 \
+    --corpus-split test[:10%]
 '''
 
-import os, argparse, random, json, numpy as np, torch
-from typing import List, Sequence, Tuple, Dict
+import os, sys, argparse, random, json, numpy as np, torch
+from typing import List, Sequence, Tuple, Dict, Optional
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+try:
+    from octo_model import inference as octo_inf
+    from octo_model.model import OctoForCausalLM
+    OCTO_AVAILABLE = True
+    OCTO_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - optional dependency
+    OCTO_AVAILABLE = False
+    OCTO_IMPORT_ERROR = exc
+    octo_inf = None  # type: ignore
+    OctoForCausalLM = None  # type: ignore
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM
 
@@ -47,6 +72,134 @@ def empty_cuda():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+
+def _maybe_adjust_dtype(model: torch.nn.Module, device: torch.device, dtype_str: str) -> torch.nn.Module:
+    dt = to_dtype(dtype_str)
+    if dt is not None:
+        if device.type == "cpu" and dt != torch.float32:
+            print(f"[GEN][OCTO] Requested dtype {dtype_str} not supported on CPU; using float32 instead.")
+            dt = torch.float32
+        return model.to(device=device, dtype=dt)
+    return model.to(device)
+
+
+def _octo_generate_single(
+    model: "OctoForCausalLM",
+    tokenizer,
+    prompt: str,
+    device: torch.device,
+    max_new: int,
+    temp: float,
+    top_p: float,
+    greedy: bool,
+) -> str:
+    enc = tokenizer(prompt, return_tensors="pt")
+    input_ids = enc["input_ids"].to(device)
+    attention_mask = enc.get("attention_mask")
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+
+    generated = input_ids
+    for _ in range(max_new):
+        outputs = model(input_ids=generated, attention_mask=attention_mask)
+        logits = outputs["logits"][:, -1, :]
+
+        if greedy:
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            logits = logits / max(temp, 1e-5)
+            probs = torch.softmax(logits, dim=-1)
+
+            if 0.0 < top_p < 1.0:
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                cumulative = torch.cumsum(sorted_probs, dim=-1)
+                mask = cumulative <= top_p
+                mask[..., 0] = True
+                filtered = torch.where(mask, sorted_probs, torch.zeros_like(sorted_probs))
+                denom = filtered.sum(dim=-1, keepdim=True)
+                filtered = torch.where(denom > 0, filtered / denom, sorted_probs)
+                choice = torch.multinomial(filtered, num_samples=1)
+                next_token = torch.gather(sorted_indices, -1, choice)
+            else:
+                next_token = torch.multinomial(probs, num_samples=1)
+
+        generated = torch.cat([generated, next_token], dim=-1)
+        if attention_mask is not None:
+            pad = torch.ones_like(next_token)
+            attention_mask = torch.cat([attention_mask, pad], dim=-1)
+
+        eos_id = tokenizer.eos_token_id
+        if eos_id is not None and int(next_token.item()) == int(eos_id):
+            break
+
+    continuation = generated[0, input_ids.shape[-1]:].detach().cpu()
+    return tokenizer.decode(continuation, skip_special_tokens=True).strip()
+
+
+def generate_octo_outputs(
+    prompts: Sequence[str],
+    checkpoint: str,
+    config_path: Optional[str],
+    tokenizer_path: Optional[str],
+    device: str,
+    dtype: str,
+    max_new: int,
+    temp: float,
+    top_p: float,
+    greedy: bool,
+) -> List[str]:
+    if not OCTO_AVAILABLE:
+        detail = f" (import error: {OCTO_IMPORT_ERROR})" if 'OCTO_IMPORT_ERROR' in globals() and OCTO_IMPORT_ERROR else ""
+        raise RuntimeError("octo_model package is not available; install or include it to use --octo-checkpoint." + detail)
+
+    ckpt_path = Path(os.path.expanduser(checkpoint)).resolve()
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Octo checkpoint not found at {ckpt_path}")
+    state_dict = octo_inf._load_state_dict(ckpt_path)
+    config, cfg_dir = octo_inf._load_config(config_path)
+    vocab_size = octo_inf._infer_vocab_size(state_dict)
+    if vocab_size is not None and config.vocab_size != vocab_size:
+        print(f"[GEN][OCTO] Adjusting vocab_size {config.vocab_size} -> {vocab_size}")
+        config.vocab_size = vocab_size
+    if config.pad_token_id is None:
+        config.pad_token_id = config.eos_token_id
+
+    auto_device = "cuda"
+    device_name = device if device not in (None, "auto") else auto_device
+    device_obj = torch.device(device_name)
+    model = OctoForCausalLM(config)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"[GEN][OCTO] Missing params: {', '.join(missing)}")
+    if unexpected:
+        print(f"[GEN][OCTO] Unexpected params: {', '.join(unexpected)}")
+    model = _maybe_adjust_dtype(model, device_obj, dtype)
+    model.eval()
+
+    tok = octo_inf._load_tokenizer(tokenizer_path, cfg_dir, ckpt_path.parent)
+    tok.padding_side = "left"
+    if tok.pad_token_id is None and tok.eos_token_id is not None:
+        tok.pad_token = tok.eos_token
+
+    outputs: List[str] = []
+    for prompt in prompts:
+        outputs.append(
+            _octo_generate_single(
+                model=model,
+                tokenizer=tok,
+                prompt=prompt,
+                device=device_obj,
+                max_new=max_new,
+                temp=temp,
+                top_p=top_p,
+                greedy=greedy,
+            )
+        )
+
+    del model
+    empty_cuda()
+    return outputs
 
 # -------------------------
 # Corpus sampling
@@ -182,6 +335,11 @@ def main():
     # PLL knobs
     ap.add_argument("--pll-batch-mask", type=int, default=16)
     ap.add_argument("--pll-maxlen",     type=int, default=256)
+    # Local Octo model support
+    ap.add_argument("--octo-checkpoint", help="Path to a locally trained Octo checkpoint (.pt/.bin/.safetensors).")
+    ap.add_argument("--octo-config", help="Optional config path or identifier for the Octo model.")
+    ap.add_argument("--octo-tokenizer", help="Tokenizer path/identifier associated with the Octo model.")
+    ap.add_argument("--octo-label", default="octo_local", help="Label used when reporting the Octo model.")
     # Corpus
     ap.add_argument("--samples", type=int, default=200)
     ap.add_argument("--prompt-min", type=int, default=30)
@@ -197,24 +355,43 @@ def main():
 
     # ----------------- Phase 1: Generate & save -----------------
     if args.phase in ("gen", "both"):
-        if not args.models:
-            raise SystemExit("--models is required for phase=gen/both")
+        if not args.models and not args.octo_checkpoint:
+            raise SystemExit("Provide --models and/or --octo-checkpoint for phase=gen/both")
         prompts, refs = sample_prompts(args.corpus_ds, args.corpus_config, args.corpus_split,
                                        args.samples, args.prompt_min, args.prompt_max, args.ref_toks, args.seed)
         print(f"[GEN] Samples: {len(prompts)} | Corpus: {args.corpus_ds}/{args.corpus_config}:{args.corpus_split}")
         generations = {}
-        for mid in args.models:
-            print(f"[GEN] {mid}")
-            outs = generate_model_outputs(
-                mid, prompts, args.gen_device, args.gen_dtype,
-                args.max_new, args.temp, args.top_p, args.batch_gen, args.greedy
+        listed_models = []
+        if args.models:
+            for mid in args.models:
+                print(f"[GEN] {mid}")
+                outs = generate_model_outputs(
+                    mid, prompts, args.gen_device, args.gen_dtype,
+                    args.max_new, args.temp, args.top_p, args.batch_gen, args.greedy
+                )
+                generations[mid] = outs
+                listed_models.append(mid)
+        if args.octo_checkpoint:
+            print(f"[GEN] {args.octo_label} (Octo)")
+            outs = generate_octo_outputs(
+                prompts=prompts,
+                checkpoint=args.octo_checkpoint,
+                config_path=args.octo_config,
+                tokenizer_path=args.octo_tokenizer,
+                device=args.gen_device,
+                dtype=args.gen_dtype,
+                max_new=args.max_new,
+                temp=args.temp,
+                top_p=args.top_p,
+                greedy=args.greedy,
             )
-            generations[mid] = outs
+            generations[args.octo_label] = outs
+            listed_models.append(args.octo_label)
         meta = {
             "corpus": f"{args.corpus_ds}/{args.corpus_config}:{args.corpus_split}",
             "seed": args.seed,
             "gen_cfg": dict(max_new=args.max_new, temp=args.temp, top_p=args.top_p, batch_gen=args.batch_gen, greedy=args.greedy),
-            "models": args.models,
+            "models": listed_models,
         }
         save_run(args.save, meta, prompts, refs, generations)
         print(f"[GEN] Saved to {args.save}")

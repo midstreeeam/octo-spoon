@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--top-k", type=int, default=0, help="Top-k sampling cutoff (0 disables)")
 
     # Device / dtype controls
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16",
                     choices=["auto", "float16", "bfloat16", "float32"])
     ap.add_argument("--trust-remote-code", action="store_true")

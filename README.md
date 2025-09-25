@@ -56,3 +56,35 @@ HuggingFaceTB/SmolLM2-360M   |  9.00% | 100.00% |      9.00% | 18/200 | 200 | 0
 HuggingFaceTB/SmolLM2-135M   |  3.50% | 100.00% |      3.50% | 7/200 | 200 | 0
 nickypro/tinyllama-42M       |  1.50% |  66.50% |      2.26% | 3/200 | 133 | 67
 ```
+
+
+Octo-AR-tinystory-2epoch benches:
+```
+pseudo pll over cc_news
+samples 200
+judge robera-large
+
+=== PLL Summary (lower is better) ===
+Model                        | mean ± std
+--------------------------------------------
+HuggingFaceTB/SmolLM2-135M   | 2.4879 ± 1.6012
+nickypro/tinyllama-42M       | 3.0176 ± 0.8496
+octo_tinystory_2ep           | 3.1667 ± 1.1875
+octo_story_2ep_wiki_1ep      | 3.3406 ± 2.3323
+HUMAN                        | 1.5283 ± 0.5924
+
+
+pseudo pll over wikitext-103-v1 test split
+samples 50
+judge robera-large
+
+=== PLL Summary (lower is better) ===
+Model                        | mean ± std
+--------------------------------------------
+HuggingFaceTB/SmolLM2-135M   | 2.9105 ± 2.5418
+octo_story_2ep_wiki_1ep      | 3.1525 ± 1.1225
+nickypro/tinyllama-42M       | 3.4654 ± 0.9270
+octo_tinystory_2ep           | 3.8024 ± 1.6455
+HUMAN                        | 2.2649 ± 0.8676
+
+```

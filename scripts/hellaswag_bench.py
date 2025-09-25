@@ -33,7 +33,7 @@ def parse_args():
     p.add_argument("--batch", type=int, default=16, help="Eval micro-batch size.")
     p.add_argument("--dtype", default="auto",
                    choices=["auto", "float16", "bfloat16", "float32", "int8", "int4"])
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda")
     p.add_argument("--limit", type=int, default=None, help="Limit #examples (quick test).")
     p.add_argument("--trust-remote-code", action="store_true")
 

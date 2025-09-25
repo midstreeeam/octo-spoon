@@ -84,7 +84,7 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
     train_loader, eval_loader = build_dataloaders(train_cfg, tokenizer)
     model = build_model(model_config, tokenizer, train_cfg.use_gradient_checkpointing)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     model.to(device)
 
     scaler = None
