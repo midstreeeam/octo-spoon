@@ -175,7 +175,12 @@ class OctoModel(nn.Module):
             causal_mask = causal_mask + expanded
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask=causal_mask)
+            if self.training and hasattr(self, '_use_gradient_checkpointing') and self._use_gradient_checkpointing:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    layer, hidden_states, causal_mask, use_reentrant=False
+                )
+            else:
+                hidden_states = layer(hidden_states, attention_mask=causal_mask)
 
         return self.norm(hidden_states)
 
