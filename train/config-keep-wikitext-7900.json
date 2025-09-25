@@ -18,7 +18,7 @@
   "save_interval_steps": 5000,
   "eval_max_batches": 64,
   "checkpoint_dir": "checkpoints/tinystory-wikitext/",
-  "resume_from": "checkpoints/tinystory/ar_tinystory_2epcho.pt",
+  "resume_from": "checkpoints/tinystory/ar_tinystory_2epoch.pt",
   "use_mixed_precision": true,
   "use_gradient_checkpointing": false
 }
