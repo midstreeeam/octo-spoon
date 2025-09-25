@@ -51,7 +51,6 @@ def evaluate(
     max_batches: Optional[int] = None,
     use_mixed_precision: bool = True,
     memory_monitor: Optional[GPUMemoryMonitor] = None,
-    step: Optional[int] = None,
 ) -> tuple[float, Optional[str]]:
     model.eval()
     losses = []
@@ -66,22 +65,20 @@ def evaluate(
 
     with torch.no_grad():
         for idx, batch in enumerate(progress_bar):
-            ctx = memory_monitor.track("eval_forward") if memory_monitor else nullcontext()
-            with ctx:
-                input_ids = batch["input_ids"].to(device)
-                labels = batch["labels"].to(device)
-                autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if autocast_enabled else nullcontext()
-                with autocast_ctx:
-                    outputs = model(input_ids=input_ids, labels=labels)
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if autocast_enabled else nullcontext()
+            with autocast_ctx:
+                outputs = model(input_ids=input_ids, labels=labels)
             losses.append(outputs["loss"].item())
             if max_batches is not None and (idx + 1) >= max_batches:
                 break
     progress_bar.close()
     model.train()
 
-    summary = memory_monitor.finalize_step("Eval", step) if memory_monitor else None
+    memory_summary = memory_monitor.snapshot(reset_peak=False) if memory_monitor else None
     mean_loss = float(sum(losses) / max(len(losses), 1))
-    return mean_loss, summary
+    return mean_loss, memory_summary
 
 
 def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[logging.Logger] = None) -> None:
@@ -144,7 +141,6 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
     steps_since_log = 0
     accumulated_loss = 0.0
     accum_steps = 0
-    memory_display: Optional[str] = None
 
     start_epoch = completed_updates // steps_per_epoch
     skip_micro_steps_initial = (completed_updates % steps_per_epoch) * gradient_accumulation
@@ -173,34 +169,31 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
                 else nullcontext()
             )
 
-            with memory_monitor.track("forward"):
-                with autocast_ctx:
-                    outputs = model(input_ids=input_ids, labels=labels)
-                loss = outputs["loss"]
-                loss_value = loss.item()
+            with autocast_ctx:
+                outputs = model(input_ids=input_ids, labels=labels)
+            loss = outputs["loss"]
+            loss_value = loss.item()
 
-            with memory_monitor.track("backward"):
-                if scaler is not None:
-                    scaled_loss = scaler.scale(loss / gradient_accumulation)
-                    scaled_loss.backward()
-                else:
-                    (loss / gradient_accumulation).backward()
+            if scaler is not None:
+                scaled_loss = scaler.scale(loss / gradient_accumulation)
+                scaled_loss.backward()
+            else:
+                (loss / gradient_accumulation).backward()
 
             accumulated_loss += loss_value
             accum_steps += 1
 
             if accum_steps % gradient_accumulation == 0:
-                with memory_monitor.track("optimizer"):
-                    if scaler is not None:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
-                        optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.max_grad_norm)
+                    optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
                 update_loss = accumulated_loss / gradient_accumulation
                 accumulated_loss = 0.0
@@ -209,30 +202,25 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
                 steps_since_log += 1
                 progress_bar.update(1)
 
-                summary = memory_monitor.finalize_step("Train", completed_updates)
-                if summary:
-                    log_event(summary, logger)
-                    if " | " in summary:
-                        memory_display = summary.split(" | ", 1)[1]
-                    else:
-                        memory_display = summary
-
-                if memory_display:
-                    progress_bar.set_postfix(mem=memory_display)
-
                 if train_cfg.log_interval_steps and completed_updates % train_cfg.log_interval_steps == 0:
                     avg_loss = running_loss / max(steps_since_log, 1)
                     perplexity = math.exp(avg_loss) if avg_loss < 20 else float("inf")
-                    progress_bar.set_postfix(
-                        step=completed_updates,
-                        loss=f"{avg_loss:.4f}",
-                        ppl=f"{perplexity:.2f}" if perplexity != float("inf") else "inf",
-                        mem=memory_display,
+                    ppl_display = f"{perplexity:.2f}" if perplexity != float("inf") else "inf"
+                    memory_snapshot = (
+                        memory_monitor.snapshot(reset_peak=True) if memory_monitor else None
                     )
-                    log_event(
-                        f"Step {completed_updates}: loss={avg_loss:.4f} ppl={perplexity:.2f}",
-                        logger,
-                    )
+                    postfix = {
+                        "step": completed_updates,
+                        "loss": f"{avg_loss:.4f}",
+                        "ppl": ppl_display,
+                    }
+                    if memory_snapshot:
+                        postfix["mem"] = memory_snapshot
+                    progress_bar.set_postfix(**postfix)
+                    log_message = f"Step {completed_updates}: loss={avg_loss:.4f} ppl={ppl_display}"
+                    if memory_snapshot:
+                        log_message += f" {memory_snapshot}"
+                    log_event(log_message, logger)
                     running_loss = 0.0
                     steps_since_log = 0
 
@@ -241,22 +229,22 @@ def train(model_config: OctoConfig, train_cfg: TrainingConfig, logger: Optional[
                     and completed_updates % train_cfg.eval_interval_steps == 0
                     and eval_loader is not None
                 ):
-                    eval_loss, eval_summary = evaluate(
+                    eval_loss, eval_memory = evaluate(
                         model,
                         eval_loader,
                         device,
                         max_batches=train_cfg.eval_max_batches,
                         use_mixed_precision=train_cfg.use_mixed_precision,
                         memory_monitor=memory_monitor,
-                        step=completed_updates,
                     )
                     eval_ppl = math.exp(eval_loss) if eval_loss < 20 else float("inf")
-                    log_event(
-                        f"[Eval] step {completed_updates}: loss={eval_loss:.4f} ppl={eval_ppl:.2f}",
-                        logger,
+                    ppl_eval_display = f"{eval_ppl:.2f}" if eval_ppl != float("inf") else "inf"
+                    eval_message = (
+                        f"[Eval] step {completed_updates}: loss={eval_loss:.4f} ppl={ppl_eval_display}"
                     )
-                    if eval_summary:
-                        log_event(eval_summary, logger)
+                    if eval_memory:
+                        eval_message += f" {eval_memory}"
+                    log_event(eval_message, logger)
 
                 if train_cfg.save_interval_steps and completed_updates % train_cfg.save_interval_steps == 0:
                     ckpt_path = save_checkpoint(
