@@ -138,7 +138,14 @@ class IterableStreamingTextDataset(IterableDataset):
 
 
 def build_dataloaders(train_cfg: TrainingConfig, tokenizer) -> tuple[DataLoader, Optional[DataLoader]]:
-    raw_train = load_dataset(train_cfg.dataset_name, split=train_cfg.train_split)
+    if train_cfg.dataset_config_name:
+        raw_train = load_dataset(
+            train_cfg.dataset_name,
+            train_cfg.dataset_config_name,
+            split=train_cfg.train_split,
+        )
+    else:
+        raw_train = load_dataset(train_cfg.dataset_name, split=train_cfg.train_split)
 
     train_dataset = StreamingTextDataset(
         raw_train,
@@ -158,7 +165,14 @@ def build_dataloaders(train_cfg: TrainingConfig, tokenizer) -> tuple[DataLoader,
 
     eval_loader: Optional[DataLoader] = None
     if train_cfg.eval_split:
-        raw_eval = load_dataset(train_cfg.dataset_name, split=train_cfg.eval_split)
+        if train_cfg.dataset_config_name:
+            raw_eval = load_dataset(
+                train_cfg.dataset_name,
+                train_cfg.dataset_config_name,
+                split=train_cfg.eval_split,
+            )
+        else:
+            raw_eval = load_dataset(train_cfg.dataset_name, split=train_cfg.eval_split)
         eval_dataset = IterableStreamingTextDataset(
             raw_eval,
             tokenizer,

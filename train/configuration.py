@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 @dataclass
 class TrainingConfig:
     dataset_name: str
+    dataset_config_name: Optional[str]
     train_split: str
     eval_split: Optional[str]
     text_column: str
@@ -36,6 +37,7 @@ class TrainingConfig:
     def from_dict(cls, data: Dict[str, Any]) -> "TrainingConfig":
         return cls(
             dataset_name=data["dataset_name"],
+            dataset_config_name=data.get("dataset_config_name"),
             train_split=data["train_split"],
             eval_split=data.get("eval_split"),
             text_column=data.get("text_column", "text"),
