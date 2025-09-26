@@ -38,16 +38,19 @@ def summarize_octodiff_model() -> None:
     input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len))
     attention_mask = torch.ones_like(input_ids)
     timesteps = torch.rand(batch_size)
-    noise = torch.randn(batch_size, seq_len, config.hidden_size)
 
     print("=== OctodiffForDiffusionLM ===")
+    mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    mask[..., -4:] = True
+
     diff_summary = summary(
         model,
         input_data={
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+            "labels": input_ids,
             "timesteps": timesteps,
-            "noise": noise,
+            "mask": mask,
         },
         col_names=("input_size", "output_size", "num_params", "kernel_size", "mult_adds"),
         depth=4,
@@ -59,8 +62,9 @@ def summarize_octodiff_model() -> None:
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            labels=input_ids,
             timesteps=timesteps,
-            noise=noise,
+            mask=mask,
         )
     print("Diffusion logits shape:", outputs["logits"].shape)
     print("Diffusion loss:", float(outputs["loss"]))

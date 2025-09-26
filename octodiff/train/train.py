@@ -68,9 +68,14 @@ def evaluate(
         for idx, batch in enumerate(progress_bar):
             input_ids = batch["input_ids"].to(device)
             attention_mask = torch.ones_like(input_ids, device=device)
+            labels = batch.get("labels")
+            if labels is not None:
+                labels = labels.to(device)
+            else:
+                labels = input_ids
             autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.float16) if autocast_enabled else nullcontext()
             with autocast_ctx:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             losses.append(float(outputs["loss"].item()))
             if max_batches is not None and (idx + 1) >= max_batches:
                 break
@@ -169,6 +174,11 @@ def train(model_config: OctodiffConfig, train_cfg: OctodiffTrainingConfig, logge
         for batch in train_loader:
             input_ids = batch["input_ids"].to(device)
             attention_mask = torch.ones_like(input_ids, device=device)
+            labels = batch.get("labels")
+            if labels is not None:
+                labels = labels.to(device)
+            else:
+                labels = input_ids
 
             autocast_ctx = (
                 torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -177,7 +187,7 @@ def train(model_config: OctodiffConfig, train_cfg: OctodiffTrainingConfig, logge
             )
 
             with autocast_ctx:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 loss = outputs["loss"]
 
             loss_value = float(loss.item())
@@ -212,7 +222,7 @@ def train(model_config: OctodiffConfig, train_cfg: OctodiffTrainingConfig, logge
                 if train_cfg.log_interval_steps and completed_updates % train_cfg.log_interval_steps == 0:
                     avg_loss = running_loss / max(steps_since_log, 1)
                     log_event(
-                        f"Step {completed_updates}: diffusion_loss={avg_loss:.6f}",
+                        f"Step {completed_updates}: mask_loss={avg_loss:.6f}",
                         logger,
                     )
                     running_loss = 0.0
@@ -231,7 +241,7 @@ def train(model_config: OctodiffConfig, train_cfg: OctodiffTrainingConfig, logge
                         use_mixed_precision=train_cfg.use_mixed_precision,
                     )
                     log_event(
-                        f"[Eval] step {completed_updates}: diffusion_loss={eval_loss:.6f}",
+                        f"[Eval] step {completed_updates}: mask_loss={eval_loss:.6f}",
                         logger,
                     )
 
