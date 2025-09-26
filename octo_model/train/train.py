@@ -14,18 +14,18 @@ from tqdm.auto import tqdm
 from transformers import get_linear_schedule_with_warmup
 
 # Ensure project root is on PYTHONPATH when running as a script
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from octo_model.config import OctoConfig
 from octo_model.model import OctoForCausalLM
 
-from train.checkpointing import load_checkpoint, save_checkpoint
-from train.configuration import TrainingConfig, load_training_config
-from train.data import build_dataloaders
-from train.logging_utils import log_event, setup_logging
-from train.utils import prepare_tokenizer, set_seed
+from octo_model.train.checkpointing import load_checkpoint, save_checkpoint
+from octo_model.train.configuration import TrainingConfig, load_training_config
+from octo_model.train.data import build_dataloaders
+from octo_model.train.logging_utils import log_event, setup_logging
+from octo_model.train.utils import prepare_tokenizer, set_seed
 
 
 def build_model(config: OctoConfig, tokenizer, use_gradient_checkpointing: bool = False) -> OctoForCausalLM:
@@ -287,7 +287,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("train/config.json"),
+        default=Path(__file__).resolve().parent / "config.json",
         help="Path to the training configuration JSON file.",
     )
     parser.add_argument(
