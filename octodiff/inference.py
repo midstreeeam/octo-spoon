@@ -1,4 +1,10 @@
-"""Inference helpers for the Octodiff diffusion language model."""
+"""Inference helpers for the Octodiff diffusion language model.
+
+python octodiff/inference.py   \
+    --prompt "Once upon a midnight dreary,"   \
+    --checkpoint checkpoints/octodiff-tinystory/octodiff_story_3ep.pt   \
+    --tokenizer gpt2 --max-new-tokens 256
+"""
 
 from __future__ import annotations
 
@@ -39,16 +45,19 @@ def _load_config(config_arg: Optional[str]) -> tuple[OctodiffConfig, Optional[Pa
     return config, None
 
 
-def _load_state_dict(checkpoint_path: Path) -> dict:
+def _load_state_dict(checkpoint_path: Path) -> tuple[dict, dict]:
     if checkpoint_path.suffix == ".safetensors":
         try:
             from safetensors.torch import load_file as load_safetensors
         except ImportError as exc:  # pragma: no cover
             raise RuntimeError("Install safetensors to load .safetensors checkpoints.") from exc
-        return load_safetensors(str(checkpoint_path))
+        payload = load_safetensors(str(checkpoint_path))
+        return payload, {}
 
     payload = torch.load(str(checkpoint_path), map_location="cpu")
-    return payload.get("model_state", payload)
+    state_dict = payload.get("model_state", payload)
+    metadata = {k: v for k, v in payload.items() if k != "model_state"}
+    return state_dict, metadata
 
 
 def _load_tokenizer(
@@ -100,7 +109,7 @@ def generate(
     max_new_tokens: int = 64,
     temperature: float = 1.0,
     num_steps: Optional[int] = None,
-    guidance_scale: Optional[float] = None,
+    top_k: int = 0,
 ) -> str:
     model.eval()
     inputs = tokenizer(prompt, return_tensors="pt")
@@ -115,7 +124,7 @@ def generate(
         num_steps=num_steps,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
-        guidance_scale=guidance_scale,
+        top_k=top_k,
     )
     return tokenizer.decode(generated_ids[0], skip_special_tokens=True)
 
@@ -126,6 +135,7 @@ def run_inference(args: argparse.Namespace) -> str:
 
     checkpoint_path: Optional[Path] = None
     state_dict: Optional[dict] = None
+    checkpoint_meta: dict = {}
     checkpoint_dir: Optional[Path] = None
     if args.checkpoint:
         checkpoint_path = Path(args.checkpoint).expanduser().resolve()
@@ -133,10 +143,18 @@ def run_inference(args: argparse.Namespace) -> str:
             raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
         if checkpoint_path.is_dir():
             raise ValueError("Pass the checkpoint file, not a directory.")
-        state_dict = _load_state_dict(checkpoint_path)
+        state_dict, checkpoint_meta = _load_state_dict(checkpoint_path)
         checkpoint_dir = checkpoint_path.parent
 
-    config, config_dir = _load_config(args.config)
+    config: Optional[OctodiffConfig] = None
+    config_dir: Optional[Path] = None
+    if args.config:
+        config, config_dir = _load_config(args.config)
+    elif "config" in checkpoint_meta:
+        config = OctodiffConfig(**checkpoint_meta["config"])
+        config_dir = checkpoint_dir
+    else:
+        config = OctodiffConfig()
 
     if state_dict is not None:
         vocab = _infer_vocab_size(state_dict)
@@ -160,7 +178,7 @@ def run_inference(args: argparse.Namespace) -> str:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         num_steps=args.num_steps,
-        guidance_scale=args.guidance_scale,
+        top_k=args.top_k,
     )
 
 
@@ -188,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Diffusion denoising steps (defaults to config.denoise_steps)",
     )
-    parser.add_argument("--guidance-scale", type=float, default=None, help="Classifier-free guidance scale")
+    parser.add_argument("--top-k", type=int, default=0, help="Optional top-k sampling cutoff (0 disables)")
     return parser
 
 

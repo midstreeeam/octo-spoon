@@ -23,6 +23,7 @@ def save_checkpoint(
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "step": step,
+        "config": model.config.to_dict(),
     }
     if scaler is not None:
         payload["scaler_state"] = scaler.state_dict()
@@ -49,4 +50,3 @@ def load_checkpoint(
         scaler.load_state_dict(payload["scaler_state"])
     step = int(payload["step"])
     return step, payload
-

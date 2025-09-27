@@ -80,8 +80,7 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
     half = dim // 2
     device = timesteps.device
-    dtype = timesteps.dtype
-    freqs = torch.exp(-math.log(max_period) * torch.arange(0, half, device=device, dtype=dtype) / half)
+    freqs = torch.exp(-math.log(max_period) * torch.arange(0, half, device=device, dtype=torch.float32) / half)
     args = timesteps[:, None] * freqs[None, :]
     emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
     if dim % 2:
@@ -101,6 +100,8 @@ class TimeEmbedding(nn.Module):
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
         emb = timestep_embedding(timesteps, self.hidden_size)
+        target_dtype = self.proj[0].weight.dtype
+        emb = emb.to(dtype=target_dtype)
         return self.proj(emb)
 
 
@@ -305,6 +306,11 @@ class OctodiffForDiffusionLM(nn.Module):
         if timesteps is None:
             timesteps = torch.rand(batch_size, device=device, dtype=base_hidden.dtype)
 
+        if not torch.is_floating_point(timesteps):
+            timesteps = timesteps.to(dtype=base_hidden.dtype)
+        else:
+            timesteps = timesteps.to(dtype=base_hidden.dtype)
+
         timesteps = torch.clamp(timesteps, min=1e-3)
         seq_len = base_hidden.size(1)
 
@@ -362,7 +368,7 @@ class OctodiffForDiffusionLM(nn.Module):
         num_steps: Optional[int] = None,
         max_new_tokens: int = 64,
         temperature: float = 1.0,
-        guidance_scale: Optional[float] = None,
+        top_k: int = 0,
     ) -> torch.LongTensor:
         self.eval()
         device = prompt_ids.device
@@ -371,44 +377,62 @@ class OctodiffForDiffusionLM(nn.Module):
         if attention_mask is None:
             attention_mask = torch.ones_like(prompt_ids, device=device)
 
-        total_len = prompt_len + max_new_tokens
         pad_token = self.config.pad_token_id if self.config.pad_token_id is not None else self.config.eos_token_id
+        eos_token = self.config.eos_token_id if self.config.eos_token_id is not None else pad_token
+
+        total_len = prompt_len + max_new_tokens
         generated = torch.full((batch_size, total_len), pad_token, dtype=prompt_ids.dtype, device=device)
         generated[:, :prompt_len] = prompt_ids
 
-        attn_mask = torch.ones_like(generated, device=device)
-        known = torch.zeros_like(generated, dtype=torch.bool)
-        known[:, :prompt_len] = True
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        steps = max_new_tokens if max_new_tokens > 0 else 0
 
-        if num_steps is None:
-            num_steps = max(self.config.denoise_steps, 1)
+        if num_steps is None or num_steps <= 0:
+            num_steps = max_new_tokens
 
-        for _ in range(num_steps):
-            unknown = ~known
-            if not unknown.any():
-                break
+        dtype = self.mask_embedding.dtype
+        schedule = torch.linspace(1.0, 0.0, steps=max(num_steps, 1), device=device, dtype=dtype)
 
-            remaining_counts = unknown.sum(dim=1)
-            timesteps = torch.clamp(remaining_counts.float() / total_len, min=1e-3)
+        for step_idx in range(steps):
+            pos = prompt_len + step_idx
+            current_len = pos + 1
+            current_ids = generated[:, :current_len]
+            current_attn = torch.ones(batch_size, current_len, device=device, dtype=torch.long)
+
+            mask = torch.zeros_like(current_ids, dtype=torch.bool)
+            mask[:, -1] = True
+
+            timestep_value = schedule[step_idx] if step_idx < schedule.numel() else schedule[-1]
+            timestep_value = torch.clamp(timestep_value, min=torch.tensor(1e-3, device=device, dtype=dtype))
+            timesteps = torch.full((batch_size,), float(timestep_value.item()), device=device, dtype=dtype)
 
             outputs = self(
-                input_ids=generated,
-                attention_mask=attn_mask,
+                input_ids=current_ids,
+                attention_mask=current_attn,
                 timesteps=timesteps,
-                mask=unknown,
+                mask=mask,
                 labels=None,
                 return_dict=True,
             )
 
-            logits = outputs["logits"] / max(temperature, 1e-5)
-            probs = torch.softmax(logits, dim=-1)
+            logits = outputs["logits"][:, -1, :]
+            logits = logits / max(temperature, 1e-5)
 
-            for idx in range(batch_size):
-                positions = torch.nonzero(unknown[idx], as_tuple=False).squeeze(-1)
-                if positions.numel() == 0:
-                    continue
-                sampled = torch.argmax(probs[idx, positions], dim=-1)
-                generated[idx, positions] = sampled
-                known[idx, positions] = True
+            if top_k > 0:
+                k = min(top_k, logits.size(-1))
+                top_values, top_indices = torch.topk(logits, k, dim=-1)
+                probs = torch.softmax(top_values, dim=-1)
+                next_tokens = top_indices.gather(-1, torch.multinomial(probs, num_samples=1))
+            else:
+                probs = torch.softmax(logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1)
+
+            next_tokens = next_tokens.squeeze(-1)
+
+            generated[:, pos] = torch.where(finished, eos_token, next_tokens)
+            finished = finished | (generated[:, pos] == eos_token)
+
+            if finished.all():
+                break
 
         return generated

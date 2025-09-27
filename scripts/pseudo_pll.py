@@ -30,7 +30,17 @@ python scripts/pseudo_pll.py --phase both --save run.json \
     --models HuggingFaceTB/SmolLM2-135M nickypro/tinyllama-42M  \
     --octo-checkpoint checkpoints/tinystory/ar_tinystory_2epoch.pt  \
     --octo-tokenizer gpt2 --prompt-min 30 --prompt-max 60 --ref-toks 40 \
-    --samples 50 --corpus-ds wikitext --corpus-config wikitext-103-raw-v1 \
+    --samples 50 --corpus-ds wikitext --corpus-config wikitext-103-v1 \
+    --corpus-split test[:10%]
+
+# run octo + octodiff
+python scripts/pseudo_pll.py --phase both --save run_octodiff.json \
+    --models HuggingFaceTB/SmolLM2-135M nickypro/tinyllama-42M \
+    --octo-checkpoint checkpoints/tinystory/ar_tinystory_2epoch.pt \
+    --octo-tokenizer gpt2 \
+    --octodiff-checkpoint checkpoints/octodiff-tinystory/octodiff_story_3ep.pt \
+    --octodiff-tokenizer gpt2 --prompt-min 30 --prompt-max 60 --ref-toks 40 \
+    --samples 50 --corpus-ds wikitext --corpus-config wikitext-103-v1 \
     --corpus-split test[:10%]
 '''
 
@@ -52,6 +62,18 @@ except Exception as exc:  # pragma: no cover - optional dependency
     OCTO_IMPORT_ERROR = exc
     octo_inf = None  # type: ignore
     OctoForCausalLM = None  # type: ignore
+
+try:
+    from octodiff import inference as octodiff_inf
+    from octodiff.model import OctodiffForDiffusionLM
+    from octodiff.config import OctodiffConfig
+    OCTODIFF_AVAILABLE = True
+    OCTODIFF_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - optional dependency
+    OCTODIFF_AVAILABLE = False
+    OCTODIFF_IMPORT_ERROR = exc
+    octodiff_inf = None  # type: ignore
+    OctodiffForDiffusionLM = None  # type: ignore
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM
 
@@ -201,6 +223,90 @@ def generate_octo_outputs(
     empty_cuda()
     return outputs
 
+
+def generate_octodiff_outputs(
+    prompts: Sequence[str],
+    checkpoint: str,
+    config_path: Optional[str],
+    tokenizer_path: Optional[str],
+    device: str,
+    dtype: str,
+    max_new: int,
+    temp: float,
+    top_k: int,
+    steps: Optional[int],
+) -> List[str]:
+    if not OCTODIFF_AVAILABLE:
+        detail = (
+            f" (import error: {OCTODIFF_IMPORT_ERROR})"
+            if 'OCTODIFF_IMPORT_ERROR' in globals() and OCTODIFF_IMPORT_ERROR
+            else ""
+        )
+        raise RuntimeError(
+            "octodiff package is not available; install or include it to use --octodiff-checkpoint." + detail
+        )
+
+    ckpt_path = Path(os.path.expanduser(checkpoint)).resolve()
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Octodiff checkpoint not found at {ckpt_path}")
+
+    state_dict, meta = octodiff_inf._load_state_dict(ckpt_path)
+    cfg_dir: Optional[Path]
+    if config_path:
+        config, cfg_dir = octodiff_inf._load_config(config_path)
+    elif "config" in meta:
+        config = OctodiffConfig(**meta["config"])
+        cfg_dir = ckpt_path.parent
+    else:
+        config, cfg_dir = octodiff_inf._load_config(None)
+
+    vocab_size = octodiff_inf._infer_vocab_size(state_dict)
+    if vocab_size is not None and config.vocab_size != vocab_size:
+        print(f"[GEN][OCTODIFF] Adjusting vocab_size {config.vocab_size} -> {vocab_size}")
+        config.vocab_size = vocab_size
+    if config.pad_token_id is None:
+        config.pad_token_id = config.eos_token_id
+
+    device_name = device if device not in (None, "auto") else ("cuda" if torch.cuda.is_available() else "cpu")
+    device_obj = torch.device(device_name)
+
+    model = OctodiffForDiffusionLM(config)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"[GEN][OCTODIFF] Missing params: {', '.join(missing)}")
+    if unexpected:
+        print(f"[GEN][OCTODIFF] Unexpected params: {', '.join(unexpected)}")
+    model = _maybe_adjust_dtype(model, device_obj, dtype)
+    model.eval()
+
+    tokenizer = octodiff_inf._load_tokenizer(tokenizer_path, cfg_dir, ckpt_path.parent)
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    outputs: List[str] = []
+    for prompt in prompts:
+        enc = tokenizer(prompt, return_tensors="pt")
+        input_ids = enc["input_ids"].to(device_obj)
+        attention_mask = enc.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device_obj)
+
+        generated = model.sample(
+            input_ids,
+            attention_mask=attention_mask,
+            num_steps=steps,
+            max_new_tokens=max_new,
+            temperature=temp,
+            top_k=top_k,
+        )
+        continuation = generated[0, input_ids.shape[-1]:].detach().cpu()
+        outputs.append(tokenizer.decode(continuation, skip_special_tokens=True).strip())
+
+    del model
+    empty_cuda()
+    return outputs
+
 # -------------------------
 # Corpus sampling
 # -------------------------
@@ -340,6 +446,13 @@ def main():
     ap.add_argument("--octo-config", help="Optional config path or identifier for the Octo model.")
     ap.add_argument("--octo-tokenizer", help="Tokenizer path/identifier associated with the Octo model.")
     ap.add_argument("--octo-label", default="octo_local", help="Label used when reporting the Octo model.")
+    # Local Octodiff model support
+    ap.add_argument("--octodiff-checkpoint", help="Path to a locally trained Octodiff checkpoint.")
+    ap.add_argument("--octodiff-config", help="Optional config path or identifier for the Octodiff model.")
+    ap.add_argument("--octodiff-tokenizer", help="Tokenizer path/identifier associated with the Octodiff model.")
+    ap.add_argument("--octodiff-label", default="octodiff_local", help="Label used when reporting the Octodiff model.")
+    ap.add_argument("--octodiff-steps", type=int, default=None, help="Inference steps for Octodiff sampling.")
+    ap.add_argument("--octodiff-top-k", type=int, default=0, help="Top-k sampling cutoff for Octodiff (0 disables).")
     # Corpus
     ap.add_argument("--samples", type=int, default=200)
     ap.add_argument("--prompt-min", type=int, default=30)
@@ -355,8 +468,8 @@ def main():
 
     # ----------------- Phase 1: Generate & save -----------------
     if args.phase in ("gen", "both"):
-        if not args.models and not args.octo_checkpoint:
-            raise SystemExit("Provide --models and/or --octo-checkpoint for phase=gen/both")
+        if not any([args.models, args.octo_checkpoint, args.octodiff_checkpoint]):
+            raise SystemExit("Provide --models, --octo-checkpoint, and/or --octodiff-checkpoint for phase=gen/both")
         prompts, refs = sample_prompts(args.corpus_ds, args.corpus_config, args.corpus_split,
                                        args.samples, args.prompt_min, args.prompt_max, args.ref_toks, args.seed)
         print(f"[GEN] Samples: {len(prompts)} | Corpus: {args.corpus_ds}/{args.corpus_config}:{args.corpus_split}")
@@ -387,6 +500,22 @@ def main():
             )
             generations[args.octo_label] = outs
             listed_models.append(args.octo_label)
+        if args.octodiff_checkpoint:
+            print(f"[GEN] {args.octodiff_label} (Octodiff)")
+            outs = generate_octodiff_outputs(
+                prompts=prompts,
+                checkpoint=args.octodiff_checkpoint,
+                config_path=args.octodiff_config,
+                tokenizer_path=args.octodiff_tokenizer,
+                device=args.gen_device,
+                dtype=args.gen_dtype,
+                max_new=args.max_new,
+                temp=args.temp,
+                top_k=args.octodiff_top_k,
+                steps=args.octodiff_steps,
+            )
+            generations[args.octodiff_label] = outs
+            listed_models.append(args.octodiff_label)
         meta = {
             "corpus": f"{args.corpus_ds}/{args.corpus_config}:{args.corpus_split}",
             "seed": args.seed,
